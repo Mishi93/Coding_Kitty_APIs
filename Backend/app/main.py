@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from groq import Groq
 
-from app import email_utils, models, security
+from . import email_utils, models, security
 from .database import engine, Base, get_db
 from .models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill
 from .schemas import (
