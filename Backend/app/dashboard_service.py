@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 from sqlalchemy.orm import Session
-from models import (
+from app.models import (
     RoadmapStep,
     Skill,
     UserDailyActivity,

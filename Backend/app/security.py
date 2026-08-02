@@ -11,7 +11,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
-from database import get_db
+from app.database import get_db
 
 # --- Configuration -----------------------------------------------------
 # In production, set these via environment variables / a secrets manager.
