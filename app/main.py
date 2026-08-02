@@ -4,7 +4,6 @@ import uuid
 import json
 from typing import List, Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
 from jose import JWTError
 from pydantic import BaseModel, Field
@@ -48,7 +47,8 @@ from app.dashboard_service import (
 # -------------------------------------------------------------------
 # Environment & LLM Client Setup
 # -------------------------------------------------------------------
-load_dotenv()
+# NOTE: load_dotenv() already ran when app.database was imported above,
+# so local .env values are available here too.
 
 api_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=api_key) if api_key else None
