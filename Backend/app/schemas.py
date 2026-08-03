@@ -220,10 +220,10 @@ class ActivityCalendarDay(BaseModel):
 # ---------------------------------------------------------------------
 # Coding Challenge Schemas
 # ---------------------------------------------------------------------
+
+# --- Video Analysis Schemas ---
 class AnalyzeVideoRequest(BaseModel):
-    roadmap_id: str = Field(..., example="roadmap_react_native_101")
-    step_title: str = Field(..., example="State Management with Redux Toolkit")
-    step_description: Optional[str] = Field(None, example="Understanding slices, store setup, and useDispatch/useSelector hooks.")
+    step_id: str = Field(..., description="UUID of the RoadmapStep in DB", example="step_uuid_here")
     youtube_url: str = Field(..., example="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
 
@@ -233,8 +233,9 @@ class LessonItem(BaseModel):
 
 
 class AnalyzeVideoResponse(BaseModel):
-    roadmap_id: str
+    step_id: str
     step_title: str
+    skill_name: str
     youtube_id: str
     is_relevant: bool
     relevance_score: int = Field(..., description="Relevance score from 0 to 100")
