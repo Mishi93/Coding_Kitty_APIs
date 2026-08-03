@@ -428,8 +428,6 @@ def get_saved_skills(
 # =====================================================================
 # Video Analysis & Coding Challenges
 # =====================================================================
-# --- Endpoint 6: Analyze Video for Roadmap Step ---
-# --- Endpoint 6: Analyze Video for Roadmap Step ---
 @app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse)
 async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Depends(get_db)):
     """
@@ -495,64 +493,94 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Dep
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
-
-
-@app.post("/api/v1/roadmap/generate-challenge", response_model=CodingChallengeResponse, tags=["roadmap"])
-async def generate_coding_challenge(
-    payload: ChallengeRequest,
-    db: Session = Depends(get_db),
-    current_user: Optional[models.User] = Depends(security.get_current_user_optional),
-):
+# --- Endpoint 7: Generate Coding Challenge ---
+@app.post("/api/v1/roadmap/generate-challenge", response_model=CodingChallengeResponse)
+async def generate_coding_challenge(payload: ChallengeRequest, db: Session = Depends(get_db)):
     """
-    Generates a coding challenge tailored to the topic and content of the video.
-    Works anonymously; contributes to the daily-challenge task/streak when logged in.
+    Fetches the roadmap step and YouTube transcript using step_id and youtube_url,
+    generates a video summary/analysis, and builds a coding challenge.
     """
     client = get_active_groq_client()
-    context_text = ""
 
-    if payload.video_summary_or_transcript:
-        context_text = payload.video_summary_or_transcript[:12000]
-    elif payload.youtube_url:
-        video_id = extract_youtube_id(payload.youtube_url)
-        context_text = fetch_youtube_transcript(video_id)[:12000]
-    else:
-        context_text = f"General concepts around: {payload.step_title}"
+    # 1. Fetch step details from database
+    step = db.query(RoadmapStep).filter(RoadmapStep.id == payload.step_id).first()
+    if not step:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Roadmap step with UUID '{payload.step_id}' not found."
+        )
 
-    system_prompt = (
+    # 2. Extract YouTube video ID & Transcript
+    video_id = extract_youtube_id(payload.youtube_url)
+    transcript = fetch_youtube_transcript(video_id)
+    truncated_transcript = transcript[:12000]
+
+    # 3. Analyze Video to generate the Summary & Key Lessons internally
+    analysis_system_prompt = (
+        "You are an expert technical curriculum builder. "
+        "Analyze the provided transcript against a specific roadmap learning step. "
+        "Return ONLY a raw JSON object with: 'summary' (string) and 'key_lessons' (list of objects with 'title' and 'takeaway')."
+    )
+
+    analysis_user_prompt = f"""
+    Skill Context: {step.skill.name if step.skill else 'N/A'}
+    Roadmap Step Title: {step.title}
+    Step Description: {step.description or 'N/A'}
+    
+    Video Transcript:
+    "{truncated_transcript}"
+    """
+
+    try:
+        analysis_res = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": analysis_system_prompt},
+                {"role": "user", "content": analysis_user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2
+        )
+        video_analysis = json.loads(analysis_res.choices[0].message.content)
+        summary_context = video_analysis.get("summary", "")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed during video summary processing: {str(e)}")
+
+    # 4. Generate Coding Challenge using step info and generated summary
+    challenge_system_prompt = (
         "You are an expert technical interviewer and coding instructor. "
-        "Create a practical coding challenge based on the topic and video context provided. "
+        "Create a practical coding challenge based on the topic and video summary provided. "
         "Return ONLY a raw JSON object with the following keys: "
         "'challenge_title' (string), 'problem_statement' (string), "
         "'starter_code' (string), 'hints' (list of strings), "
         "and 'expected_output_or_criteria' (string)."
     )
 
-    user_prompt = f"""
-    Roadmap Step: {payload.step_title}
+    challenge_user_prompt = f"""
+    Skill Context: {step.skill.name if step.skill else 'N/A'}
+    Roadmap Step: {step.title}
     Difficulty: {payload.difficulty}
-    Context/Content:
-    "{context_text}"
+    Video Summary: {summary_context}
     """
 
     try:
-        response = client.chat.completions.create(
+        challenge_res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": challenge_system_prompt},
+                {"role": "user", "content": challenge_user_prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.4
         )
 
-        result = json.loads(response.choices[0].message.content)
+        result = json.loads(challenge_res.choices[0].message.content)
 
-        if current_user:
-            record_daily_activity(current_user.id, ACTIVITY_CHALLENGE, db)
+        record_daily_activity("default_user", ACTIVITY_CHALLENGE, db)
 
         return CodingChallengeResponse(
-            roadmap_id=payload.roadmap_id,
-            step_title=payload.step_title,
+            roadmap_id=step.id,
+            step_title=step.title,
             difficulty=payload.difficulty or "Medium",
             challenge_title=result.get("challenge_title", "Hands-on Exercise"),
             problem_statement=result.get("problem_statement", ""),
@@ -562,21 +590,20 @@ async def generate_coding_challenge(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM challenge generation failed: {str(e)}")
 
-
-@app.get("/api/v1/skills/{skill_id}/challenge", response_model=SkillChallengeResponse, tags=["roadmap"])
+# --- Endpoint 8: Generate Coding Challenge from Skill ID Only ---
+@app.get("/api/v1/skills/{skill_id}/challenge", response_model=SkillChallengeResponse)
 def generate_challenge_for_skill(
     skill_id: str,
     difficulty: Optional[str] = "Medium",
-    db: Session = Depends(get_db),
-    current_user: Optional[models.User] = Depends(security.get_current_user_optional),
+    db: Session = Depends(get_db)
 ):
     """
     Generates a coding challenge for a skill using only its skill_id.
     Automatically pulls the skill's name, description, and roadmap steps
-    from the database to build context for the LLM. Works anonymously;
-    contributes to the daily-challenge task/streak when logged in.
+    from the database to build context for the LLM - no manual
+    roadmap_id/step_title/transcript input required.
     """
     client = get_active_groq_client()
 
@@ -625,8 +652,7 @@ def generate_challenge_for_skill(
 
         result = json.loads(response.choices[0].message.content)
 
-        if current_user:
-            record_daily_activity(current_user.id, ACTIVITY_CHALLENGE, db)
+        record_daily_activity("default_user", ACTIVITY_CHALLENGE, db)
 
         return SkillChallengeResponse(
             skill_id=skill.id,
