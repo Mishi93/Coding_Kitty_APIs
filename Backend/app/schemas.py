@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from models import Gender
+from app.models import Gender
 
 # ---------------------------------------------------------------------
 # Auth Schemas
@@ -220,17 +220,14 @@ class ActivityCalendarDay(BaseModel):
 # ---------------------------------------------------------------------
 # Coding Challenge Schemas
 # ---------------------------------------------------------------------
-
 # --- Video Analysis Schemas ---
 class AnalyzeVideoRequest(BaseModel):
     step_id: str = Field(..., description="UUID of the RoadmapStep in DB", example="step_uuid_here")
     youtube_url: str = Field(..., example="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
-
 class LessonItem(BaseModel):
     title: str
     takeaway: str
-
 
 class AnalyzeVideoResponse(BaseModel):
     step_id: str
