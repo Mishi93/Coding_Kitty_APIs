@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from app.models import Gender
+from models import Gender
 
 # ---------------------------------------------------------------------
 # Auth Schemas
