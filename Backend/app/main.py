@@ -13,9 +13,9 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from groq import Groq
 
 import email_utils, models, security
-from app.database import engine, Base, get_db
-from app.models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill
-from app.schemas import (
+from database import engine, Base, get_db
+from models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill
+from schemas import (
     # auth
     SignUpRequest, SignInRequest, AuthResponse, SignInResponse,
     RefreshRequest, TokenResponse, ForgotPasswordRequest, ForgotPasswordResponse,
