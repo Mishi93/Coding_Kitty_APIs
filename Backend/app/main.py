@@ -22,10 +22,10 @@ except ImportError:
     GenericProxyConfig = None
 from groq import Groq
 
-from app import email_utils, models, security
-from app.database import engine, Base, get_db
-from app.models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill, ChatSession
-from app.schemas import (
+import email_utils, models, security
+from database import engine, Base, get_db
+from models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill, ChatSession
+from schemas import (
     # auth
     SignUpRequest, SignInRequest, AuthResponse, SignInResponse,
     RefreshRequest, TokenResponse, ForgotPasswordRequest, ForgotPasswordResponse,
@@ -41,8 +41,8 @@ from app.schemas import (
     StepCompleteResponse, SkillProgressResponse, SkillProgressOverviewItem,
     StreakResponse, DailyTasksResponse, ActivityCalendarDay,
 )
-from app.services import process_chat_session
-from app.dashboard_service import (
+from services import process_chat_session
+from dashboard_service import (
     record_daily_activity,
     get_streak_info,
     get_daily_tasks,
