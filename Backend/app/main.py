@@ -31,8 +31,8 @@ from schemas import (
     StepCompleteResponse, SkillProgressResponse, SkillProgressOverviewItem,
     StreakResponse, DailyTasksResponse, ActivityCalendarDay,
 )
-from app.services import process_chat_session
-from app.dashboard_service import (
+from services import process_chat_session
+from dashboard_service import (
     record_daily_activity,
     get_streak_info,
     get_daily_tasks,
