@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.types import TypeDecorator, CHAR
 from sqlalchemy.orm import relationship
 
-from .database import Base
+from database import Base
 
 
 def generate_uuid():
