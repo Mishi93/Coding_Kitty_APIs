@@ -428,18 +428,30 @@ def get_saved_skills(
 # =====================================================================
 # Video Analysis & Coding Challenges
 # =====================================================================
-@app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse, tags=["roadmap"])
-async def analyze_video_for_step(payload: AnalyzeVideoRequest):
+# --- Endpoint 6: Analyze Video for Roadmap Step ---
+# --- Endpoint 6: Analyze Video for Roadmap Step ---
+@app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse)
+async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Depends(get_db)):
     """
-    Checks if a YouTube video aligns with a specific roadmap step,
-    extracts core lessons, and structures the findings.
+    Checks if a YouTube video aligns with a specific roadmap step using step_id.
+    Automatically fetches the step title, description, and skill name from the DB.
     """
     client = get_active_groq_client()
+
+    # 1. Fetch step details from database
+    step = db.query(RoadmapStep).filter(RoadmapStep.id == payload.step_id).first()
+    if not step:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Roadmap step with UUID '{payload.step_id}' not found."
+        )
+
+    # 2. Extract YouTube video ID & transcript
     video_id = extract_youtube_id(payload.youtube_url)
     transcript = fetch_youtube_transcript(video_id)
-
     truncated_transcript = transcript[:12000]
 
+    # 3. Construct LLM Prompts using fetched DB data
     system_prompt = (
         "You are an expert technical curriculum builder. "
         "Analyze the provided transcript against a specific roadmap learning step. "
@@ -449,9 +461,10 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest):
     )
 
     user_prompt = f"""
-    Roadmap Step: {payload.step_title}
-    Step Description: {payload.step_description or 'N/A'}
-
+    Skill Context: {step.skill.name if step.skill else 'N/A'}
+    Roadmap Step Title: {step.title}
+    Step Description: {step.description or 'N/A'}
+    
     Video Transcript Excerpt:
     "{truncated_transcript}"
     """
@@ -466,12 +479,13 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest):
             response_format={"type": "json_object"},
             temperature=0.2
         )
-
+        
         result = json.loads(response.choices[0].message.content)
 
         return AnalyzeVideoResponse(
-            roadmap_id=payload.roadmap_id,
-            step_title=payload.step_title,
+            step_id=step.id,
+            step_title=step.title,
+            skill_name=step.skill.name if step.skill else "",
             youtube_id=video_id,
             is_relevant=result.get("is_relevant", False),
             relevance_score=result.get("relevance_score", 0),
