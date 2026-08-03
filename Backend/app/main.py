@@ -5,17 +5,27 @@ import json
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+try:
+    # Available in youtube-transcript-api >= 0.6.2. Lets us route transcript
+    # fetches through a proxy so the endpoint keeps working when deployed on
+    # a public server/cloud host whose IP YouTube has rate-limited or blocked
+    # (a very common issue once this leaves localhost).
+    from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
+except ImportError:
+    WebshareProxyConfig = None
+    GenericProxyConfig = None
 from groq import Groq
 
-import email_utils, models, security
-from database import engine, Base, get_db
-from models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill
-from schemas import (
+from app import email_utils, models, security
+from app.database import engine, Base, get_db
+from app.models import Skill, RoadmapStep, SuggestedSkillLog, UserSavedSkill, ChatSession
+from app.schemas import (
     # auth
     SignUpRequest, SignInRequest, AuthResponse, SignInResponse,
     RefreshRequest, TokenResponse, ForgotPasswordRequest, ForgotPasswordResponse,
@@ -31,8 +41,8 @@ from schemas import (
     StepCompleteResponse, SkillProgressResponse, SkillProgressOverviewItem,
     StreakResponse, DailyTasksResponse, ActivityCalendarDay,
 )
-from services import process_chat_session
-from dashboard_service import (
+from app.services import process_chat_session
+from app.dashboard_service import (
     record_daily_activity,
     get_streak_info,
     get_daily_tasks,
@@ -59,6 +69,19 @@ app = FastAPI(
     title="Skill Guidance Platform API",
     description="Authentication, skill guidance chat, YouTube video roadmap analysis, coding challenges, and a student progress dashboard.",
     version="3.0.0"
+)
+
+# This is a public API meant to be called from any frontend domain/server
+# (web app, mobile app, other hosts), so allow all origins. Credentials
+# (cookies/auth headers handled via bearer token, not cookies) stay disabled
+# here since browsers reject `allow_credentials=True` combined with a
+# wildcard origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # -------------------------------------------------------------------
@@ -105,15 +128,63 @@ def extract_youtube_id(url_or_id: str) -> str:
     raise HTTPException(status_code=400, detail="Invalid YouTube Video URL or ID.")
 
 
+def _build_youtube_proxy_config():
+    """
+    Build a proxy config for youtube_transcript_api from environment
+    variables, if any are set.
+
+    Why this matters: YouTube aggressively rate-limits / blocks the shared
+    IP ranges used by cloud hosts (Railway, Render, AWS, etc.). A transcript
+    fetch that works fine from your laptop will often fail once deployed to
+    a public server. Routing the request through a proxy fixes this so the
+    endpoint works reliably no matter which server/domain it's deployed on.
+
+    Supported configuration (set whichever you have):
+      - Webshare "Residential" proxy (recommended, youtube_transcript_api's
+        first-class option): WEBSHARE_PROXY_USERNAME / WEBSHARE_PROXY_PASSWORD
+      - Any generic HTTP/HTTPS proxy: YTA_HTTP_PROXY / YTA_HTTPS_PROXY
+        (falls back to the standard HTTP_PROXY / HTTPS_PROXY env vars)
+
+    If none are set, requests go out directly from the server — fine until
+    YouTube starts blocking that IP, at which point set one of the above.
+    """
+    ws_user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    ws_pass = os.getenv("WEBSHARE_PROXY_PASSWORD")
+    if WebshareProxyConfig and ws_user and ws_pass:
+        return WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass)
+
+    http_proxy = os.getenv("YTA_HTTP_PROXY") or os.getenv("HTTP_PROXY")
+    https_proxy = os.getenv("YTA_HTTPS_PROXY") or os.getenv("HTTPS_PROXY")
+    if GenericProxyConfig and (http_proxy or https_proxy):
+        return GenericProxyConfig(
+            http_url=http_proxy or https_proxy,
+            https_url=https_proxy or http_proxy,
+        )
+
+    return None
+
+
+_youtube_proxy_config = _build_youtube_proxy_config()
+_youtube_client = (
+    YouTubeTranscriptApi(proxy_config=_youtube_proxy_config)
+    if _youtube_proxy_config
+    else YouTubeTranscriptApi()
+)
+
+
 def fetch_youtube_transcript(video_id: str) -> str:
     """Retrieves and concatenates transcript text for a YouTube video."""
     try:
-        try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US'])
-        except AttributeError:
-            transcript_list = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'en-US'])
+        transcript_list = _youtube_client.fetch(video_id, languages=['en', 'en-US'])
 
-        full_text = " ".join([item['text'] for item in transcript_list])
+        # youtube_transcript_api >= 1.0 returns a FetchedTranscript whose
+        # items are FetchedTranscriptSnippet objects (attribute access via
+        # `.text`), not dicts (`item['text']`). Support both so this keeps
+        # working regardless of which version is installed.
+        def _snippet_text(item):
+            return item.text if hasattr(item, "text") else item["text"]
+
+        full_text = " ".join(_snippet_text(item) for item in transcript_list)
         return full_text
     except (TranscriptsDisabled, NoTranscriptFound):
         raise HTTPException(status_code=404, detail="No public English transcript found for this video.")
@@ -323,10 +394,14 @@ def chat_endpoint(
     )
 
 # =====================================================================
-# Skills / Roadmap (public)
+# Skills / Roadmap (requires auth)
 # =====================================================================
 @app.get("/api/skills/{skill_id}/roadmap", response_model=SkillRoadmapResponse, tags=["skills"])
-def get_skill_roadmap(skill_id: str, db: Session = Depends(get_db)):
+def get_skill_roadmap(
+    skill_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(security.get_current_user),
+):
     skill = db.query(Skill).filter(Skill.id == skill_id).first()
     if not skill:
         raise HTTPException(
@@ -349,8 +424,22 @@ def get_skill_roadmap(skill_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/skills/suggested", response_model=List[SuggestedSkill], tags=["skills"])
-def get_all_suggested_skills(session_id: Optional[str] = None, db: Session = Depends(get_db)):
-    query = db.query(Skill).join(SuggestedSkillLog, Skill.id == SuggestedSkillLog.skill_id)
+def get_all_suggested_skills(
+    session_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(security.get_current_user),
+):
+    """
+    Returns skills suggested by chat, scoped to the authenticated user's
+    own chat sessions only — one user can no longer see skills that were
+    suggested to someone else's (or an anonymous) session.
+    """
+    query = (
+        db.query(Skill)
+        .join(SuggestedSkillLog, Skill.id == SuggestedSkillLog.skill_id)
+        .join(ChatSession, ChatSession.id == SuggestedSkillLog.session_id)
+        .filter(ChatSession.user_id == current_user.id)
+    )
 
     if session_id:
         query = query.filter(SuggestedSkillLog.session_id == session_id)
@@ -428,28 +517,39 @@ def get_saved_skills(
 # =====================================================================
 # Video Analysis & Coding Challenges
 # =====================================================================
-@app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse)
-async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Depends(get_db)):
+@app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse, tags=["roadmap"])
+async def analyze_video_for_step(
+    payload: AnalyzeVideoRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(security.get_current_user),
+):
     """
-    Checks if a YouTube video aligns with a specific roadmap step using step_id.
-    Automatically fetches the step title, description, and skill name from the DB.
+    Checks if a YouTube video aligns with a specific roadmap step,
+    extracts core lessons, and structures the findings.
+
+    Requires authentication: this was the one endpoint left without any
+    auth dependency, and it burns Groq/LLM API cost per call, so it's now
+    locked to logged-in users like its sibling roadmap endpoints
+    (generate-challenge, skills/{id}/challenge).
     """
     client = get_active_groq_client()
 
-    # 1. Fetch step details from database
+    # AnalyzeVideoRequest only carries step_id + youtube_url — step title/
+    # description and the skill name are looked up from the DB, not taken
+    # off the payload (they were never fields on it).
     step = db.query(RoadmapStep).filter(RoadmapStep.id == payload.step_id).first()
     if not step:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Roadmap step with UUID '{payload.step_id}' not found."
+            detail=f"Roadmap step '{payload.step_id}' not found."
         )
+    skill = db.query(Skill).filter(Skill.id == step.skill_id).first()
 
-    # 2. Extract YouTube video ID & transcript
     video_id = extract_youtube_id(payload.youtube_url)
     transcript = fetch_youtube_transcript(video_id)
+
     truncated_transcript = transcript[:12000]
 
-    # 3. Construct LLM Prompts using fetched DB data
     system_prompt = (
         "You are an expert technical curriculum builder. "
         "Analyze the provided transcript against a specific roadmap learning step. "
@@ -459,10 +559,9 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Dep
     )
 
     user_prompt = f"""
-    Skill Context: {step.skill.name if step.skill else 'N/A'}
-    Roadmap Step Title: {step.title}
+    Roadmap Step: {step.title}
     Step Description: {step.description or 'N/A'}
-    
+
     Video Transcript Excerpt:
     "{truncated_transcript}"
     """
@@ -477,13 +576,13 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Dep
             response_format={"type": "json_object"},
             temperature=0.2
         )
-        
+
         result = json.loads(response.choices[0].message.content)
 
         return AnalyzeVideoResponse(
             step_id=step.id,
             step_title=step.title,
-            skill_name=step.skill.name if step.skill else "",
+            skill_name=skill.name if skill else "",
             youtube_id=video_id,
             is_relevant=result.get("is_relevant", False),
             relevance_score=result.get("relevance_score", 0),
@@ -493,94 +592,64 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest, db: Session = Dep
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
-# --- Endpoint 7: Generate Coding Challenge ---
-@app.post("/api/v1/roadmap/generate-challenge", response_model=CodingChallengeResponse)
-async def generate_coding_challenge(payload: ChallengeRequest, db: Session = Depends(get_db)):
+
+
+@app.post("/api/v1/roadmap/generate-challenge", response_model=CodingChallengeResponse, tags=["roadmap"])
+async def generate_coding_challenge(
+    payload: ChallengeRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(security.get_current_user_optional),
+):
     """
-    Fetches the roadmap step and YouTube transcript using step_id and youtube_url,
-    generates a video summary/analysis, and builds a coding challenge.
+    Generates a coding challenge tailored to the topic and content of the video.
+    Works anonymously; contributes to the daily-challenge task/streak when logged in.
     """
     client = get_active_groq_client()
+    context_text = ""
 
-    # 1. Fetch step details from database
-    step = db.query(RoadmapStep).filter(RoadmapStep.id == payload.step_id).first()
-    if not step:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Roadmap step with UUID '{payload.step_id}' not found."
-        )
+    if payload.video_summary_or_transcript:
+        context_text = payload.video_summary_or_transcript[:12000]
+    elif payload.youtube_url:
+        video_id = extract_youtube_id(payload.youtube_url)
+        context_text = fetch_youtube_transcript(video_id)[:12000]
+    else:
+        context_text = f"General concepts around: {payload.step_title}"
 
-    # 2. Extract YouTube video ID & Transcript
-    video_id = extract_youtube_id(payload.youtube_url)
-    transcript = fetch_youtube_transcript(video_id)
-    truncated_transcript = transcript[:12000]
-
-    # 3. Analyze Video to generate the Summary & Key Lessons internally
-    analysis_system_prompt = (
-        "You are an expert technical curriculum builder. "
-        "Analyze the provided transcript against a specific roadmap learning step. "
-        "Return ONLY a raw JSON object with: 'summary' (string) and 'key_lessons' (list of objects with 'title' and 'takeaway')."
-    )
-
-    analysis_user_prompt = f"""
-    Skill Context: {step.skill.name if step.skill else 'N/A'}
-    Roadmap Step Title: {step.title}
-    Step Description: {step.description or 'N/A'}
-    
-    Video Transcript:
-    "{truncated_transcript}"
-    """
-
-    try:
-        analysis_res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": analysis_system_prompt},
-                {"role": "user", "content": analysis_user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2
-        )
-        video_analysis = json.loads(analysis_res.choices[0].message.content)
-        summary_context = video_analysis.get("summary", "")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed during video summary processing: {str(e)}")
-
-    # 4. Generate Coding Challenge using step info and generated summary
-    challenge_system_prompt = (
+    system_prompt = (
         "You are an expert technical interviewer and coding instructor. "
-        "Create a practical coding challenge based on the topic and video summary provided. "
+        "Create a practical coding challenge based on the topic and video context provided. "
         "Return ONLY a raw JSON object with the following keys: "
         "'challenge_title' (string), 'problem_statement' (string), "
         "'starter_code' (string), 'hints' (list of strings), "
         "and 'expected_output_or_criteria' (string)."
     )
 
-    challenge_user_prompt = f"""
-    Skill Context: {step.skill.name if step.skill else 'N/A'}
-    Roadmap Step: {step.title}
+    user_prompt = f"""
+    Roadmap Step: {payload.step_title}
     Difficulty: {payload.difficulty}
-    Video Summary: {summary_context}
+    Context/Content:
+    "{context_text}"
     """
 
     try:
-        challenge_res = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": challenge_system_prompt},
-                {"role": "user", "content": challenge_user_prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.4
         )
 
-        result = json.loads(challenge_res.choices[0].message.content)
+        result = json.loads(response.choices[0].message.content)
 
-        record_daily_activity("default_user", ACTIVITY_CHALLENGE, db)
+        if current_user:
+            record_daily_activity(current_user.id, ACTIVITY_CHALLENGE, db)
 
         return CodingChallengeResponse(
-            roadmap_id=step.id,
-            step_title=step.title,
+            roadmap_id=payload.roadmap_id,
+            step_title=payload.step_title,
             difficulty=payload.difficulty or "Medium",
             challenge_title=result.get("challenge_title", "Hands-on Exercise"),
             problem_statement=result.get("problem_statement", ""),
@@ -590,20 +659,21 @@ async def generate_coding_challenge(payload: ChallengeRequest, db: Session = Dep
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM challenge generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
 
-# --- Endpoint 8: Generate Coding Challenge from Skill ID Only ---
-@app.get("/api/v1/skills/{skill_id}/challenge", response_model=SkillChallengeResponse)
+
+@app.get("/api/v1/skills/{skill_id}/challenge", response_model=SkillChallengeResponse, tags=["roadmap"])
 def generate_challenge_for_skill(
     skill_id: str,
     difficulty: Optional[str] = "Medium",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(security.get_current_user_optional),
 ):
     """
     Generates a coding challenge for a skill using only its skill_id.
     Automatically pulls the skill's name, description, and roadmap steps
-    from the database to build context for the LLM - no manual
-    roadmap_id/step_title/transcript input required.
+    from the database to build context for the LLM. Works anonymously;
+    contributes to the daily-challenge task/streak when logged in.
     """
     client = get_active_groq_client()
 
@@ -652,7 +722,8 @@ def generate_challenge_for_skill(
 
         result = json.loads(response.choices[0].message.content)
 
-        record_daily_activity("default_user", ACTIVITY_CHALLENGE, db)
+        if current_user:
+            record_daily_activity(current_user.id, ACTIVITY_CHALLENGE, db)
 
         return SkillChallengeResponse(
             skill_id=skill.id,
