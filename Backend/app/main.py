@@ -715,5 +715,14 @@ def activity_calendar(
 ):
     if days < 1 or days > 365:
         raise HTTPException(status_code=400, detail="days must be between 1 and 365.")
+    
     calendar = get_activity_calendar(current_user.id, days, db)
-    return [ActivityCalendarDay(**day) for day in calendar]
+    
+    # Filter out days with zero activity
+    active_days_only = [
+        ActivityCalendarDay(**day) 
+        for day in calendar 
+        if day.get("activity_count", 0) > 0
+    ]
+    
+    return active_days_only
