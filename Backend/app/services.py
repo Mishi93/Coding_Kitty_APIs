@@ -6,8 +6,8 @@ from typing import Optional
 from fastapi import HTTPException, status
 from groq import Groq
 from sqlalchemy.orm import Session
-from app.models import Skill, ChatSession, ChatMessage, SuggestedSkillLog
-from app.schemas import GroqChatLLMOutput
+from models import Skill, ChatSession, ChatMessage, SuggestedSkillLog
+from schemas import GroqChatLLMOutput
 
 _groq_client: Optional[Groq] = None
 
