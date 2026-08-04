@@ -3,12 +3,29 @@ import json
 import re
 import uuid
 from typing import Optional
+from fastapi import HTTPException, status
 from groq import Groq
 from sqlalchemy.orm import Session
-from models import Skill, ChatSession, ChatMessage, SuggestedSkillLog
-from schemas import GroqChatLLMOutput
+from app.models import Skill, ChatSession, ChatMessage, SuggestedSkillLog
+from app.schemas import GroqChatLLMOutput
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_groq_client: Optional[Groq] = None
+
+
+def _get_groq_client() -> Groq:
+    """Lazily create the Groq client so a missing/blank API key doesn't
+    crash the whole app at import time — it only errors when chat is
+    actually used, with a clear message instead of a bare startup crash."""
+    global _groq_client
+    if _groq_client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="GROQ_API_KEY is missing in your environment configuration."
+            )
+        _groq_client = Groq(api_key=api_key)
+    return _groq_client
 
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "is", "are", "was", "were", "be", "been",
@@ -147,15 +164,28 @@ def process_chat_session(
         db.commit()
 
     # 4. Call Groq API
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0.3
-    )
-
-    raw_content = response.choices[0].message.content
-    data = json.loads(raw_content)
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3
+        )
+        raw_content = response.choices[0].message.content
+        data = json.loads(raw_content)
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Groq returned a response that wasn't valid JSON: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Groq API call failed: {str(e)}"
+        )
 
     llm_output = GroqChatLLMOutput(
         reply=data.get("reply", ""),
