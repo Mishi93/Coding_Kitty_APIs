@@ -48,9 +48,6 @@ from dashboard_service import (
 # -------------------------------------------------------------------
 # Environment & LLM Client Setup
 # -------------------------------------------------------------------
-# NOTE: load_dotenv() already ran when app.database was imported above,
-# so local .env values are available here too.
-
 api_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=api_key) if api_key else None
 
@@ -110,14 +107,6 @@ _youtube_transcript_client: Optional[YouTubeTranscriptApi] = None
 
 
 def _get_youtube_transcript_client() -> YouTubeTranscriptApi:
-    """
-    Lazily builds the YouTubeTranscriptApi client. If WEBSHARE_PROXY_USERNAME
-    and WEBSHARE_PROXY_PASSWORD are set, requests are routed through a
-    Webshare residential proxy - required on cloud hosts like Railway,
-    since YouTube blocks requests coming from datacenter IPs directly.
-    Without those env vars set, this falls back to a direct (unproxied)
-    client, which works locally but will likely hit IP blocks in production.
-    """
     global _youtube_transcript_client
     if _youtube_transcript_client is None:
         proxy_username = os.getenv("WEBSHARE_PROXY_USERNAME")
@@ -213,8 +202,6 @@ def sign_up(payload: SignUpRequest, db: Session = Depends(get_db)):
 def sign_in(payload: SignInRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.email == payload.email).first()
 
-    # Use the same error for "no such user" and "wrong password" so we don't
-    # leak which emails are registered.
     invalid_credentials = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid email or password",
@@ -276,8 +263,6 @@ def refresh_token_endpoint(payload: RefreshRequest, db: Session = Depends(get_db
 def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.email == payload.email).first()
 
-    # Generic response either way, so we don't reveal which emails are
-    # registered (email enumeration protection).
     generic_message = (
         "If an account exists for this email, a temporary password has been sent."
     )
@@ -299,7 +284,6 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
 
 @app.get("/auth/me", response_model=CurrentUserResponse, tags=["auth"])
 def get_me(current_user: models.User = Depends(security.get_current_user)):
-    """Returns the profile of whoever the access token belongs to."""
     return CurrentUserResponse(
         user_id=current_user.id,
         email=current_user.email,
@@ -322,10 +306,6 @@ def chat_endpoint(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(security.get_current_user_optional),
 ):
-    """
-    Works anonymously. If a valid access token is supplied, the chat
-    session (and today's chat activity credit) is tied to that account.
-    """
     session_id, llm_output = process_chat_session(
         payload.session_id,
         payload.message,
@@ -433,7 +413,6 @@ def get_saved_skills(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(security.get_current_user),
 ):
-    """Retrieves all skills favorited/saved by the authenticated user."""
     saved_entries = (
         db.query(UserSavedSkill)
         .filter(UserSavedSkill.user_id == current_user.id)
@@ -455,15 +434,29 @@ def get_saved_skills(
 # Video Analysis & Coding Challenges
 # =====================================================================
 @app.post("/api/v1/roadmap/analyze-video", response_model=AnalyzeVideoResponse, tags=["roadmap"])
-async def analyze_video_for_step(payload: AnalyzeVideoRequest):
+async def analyze_video_for_step(
+    payload: AnalyzeVideoRequest,
+    db: Session = Depends(get_db)
+):
     """
     Checks if a YouTube video aligns with a specific roadmap step,
     extracts core lessons, and structures the findings.
     """
+    # 1. Fetch step and related skill from DB
+    step = db.query(RoadmapStep).filter(RoadmapStep.id == payload.step_id).first()
+    if not step:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"RoadmapStep with ID '{payload.step_id}' not found."
+        )
+
+    skill = db.query(Skill).filter(Skill.id == step.skill_id).first()
+    skill_name = skill.name if skill else "Unknown Skill"
+
+    # 2. Extract transcript & setup Groq Client
     client = get_active_groq_client()
     video_id = extract_youtube_id(payload.youtube_url)
     transcript = fetch_youtube_transcript(video_id)
-
     truncated_transcript = transcript[:12000]
 
     system_prompt = (
@@ -475,8 +468,9 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest):
     )
 
     user_prompt = f"""
-    Roadmap Step: {payload.step_title}
-    Step Description: {payload.step_description or 'N/A'}
+    Skill Name: {skill_name}
+    Roadmap Step Title: {step.title}
+    Step Description: {step.description or 'N/A'}
 
     Video Transcript Excerpt:
     "{truncated_transcript}"
@@ -496,8 +490,9 @@ async def analyze_video_for_step(payload: AnalyzeVideoRequest):
         result = json.loads(response.choices[0].message.content)
 
         return AnalyzeVideoResponse(
-            roadmap_id=payload.roadmap_id,
-            step_title=payload.step_title,
+            step_id=step.id,
+            step_title=step.title,
+            skill_name=skill_name,
             youtube_id=video_id,
             is_relevant=result.get("is_relevant", False),
             relevance_score=result.get("relevance_score", 0),
@@ -515,10 +510,6 @@ async def generate_coding_challenge(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(security.get_current_user_optional),
 ):
-    """
-    Generates a coding challenge tailored to the topic and content of the video.
-    Works anonymously; contributes to the daily-challenge task/streak when logged in.
-    """
     client = get_active_groq_client()
     context_text = ""
 
@@ -584,12 +575,6 @@ def generate_challenge_for_skill(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(security.get_current_user_optional),
 ):
-    """
-    Generates a coding challenge for a skill using only its skill_id.
-    Automatically pulls the skill's name, description, and roadmap steps
-    from the database to build context for the LLM. Works anonymously;
-    contributes to the daily-challenge task/streak when logged in.
-    """
     client = get_active_groq_client()
 
     skill = db.query(Skill).filter(Skill.id == skill_id).first()
@@ -663,7 +648,6 @@ def complete_roadmap_step(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(security.get_current_user),
 ):
-    """Marks a roadmap step as completed. Counts toward today's task checklist and the streak."""
     progress = mark_step_complete(current_user.id, step_id, db)
     if not progress:
         raise HTTPException(
