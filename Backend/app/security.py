@@ -12,6 +12,7 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from database import get_db
+import models
 
 # --- Configuration -----------------------------------------------------
 # In production, set these via environment variables / a secrets manager.
@@ -76,8 +77,6 @@ def generate_temporary_password(length: int = 12) -> str:
 # ---------------------------------------------------------------------
 def _resolve_user_from_token(token: str, db: Session):
     """Shared logic: decode an access token and load the matching User."""
-    from app import models  # local import avoids a circular import with models.py
-
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
