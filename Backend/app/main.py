@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api.proxies import WebshareProxyConfig
 from groq import Groq
 
 import email_utils, models, security
@@ -105,15 +106,40 @@ def extract_youtube_id(url_or_id: str) -> str:
     raise HTTPException(status_code=400, detail="Invalid YouTube Video URL or ID.")
 
 
+_youtube_transcript_client: Optional[YouTubeTranscriptApi] = None
+
+
+def _get_youtube_transcript_client() -> YouTubeTranscriptApi:
+    """
+    Lazily builds the YouTubeTranscriptApi client. If WEBSHARE_PROXY_USERNAME
+    and WEBSHARE_PROXY_PASSWORD are set, requests are routed through a
+    Webshare residential proxy - required on cloud hosts like Railway,
+    since YouTube blocks requests coming from datacenter IPs directly.
+    Without those env vars set, this falls back to a direct (unproxied)
+    client, which works locally but will likely hit IP blocks in production.
+    """
+    global _youtube_transcript_client
+    if _youtube_transcript_client is None:
+        proxy_username = os.getenv("WEBSHARE_PROXY_USERNAME")
+        proxy_password = os.getenv("WEBSHARE_PROXY_PASSWORD")
+        if proxy_username and proxy_password:
+            _youtube_transcript_client = YouTubeTranscriptApi(
+                proxy_config=WebshareProxyConfig(
+                    proxy_username=proxy_username,
+                    proxy_password=proxy_password,
+                )
+            )
+        else:
+            _youtube_transcript_client = YouTubeTranscriptApi()
+    return _youtube_transcript_client
+
+
 def fetch_youtube_transcript(video_id: str) -> str:
     """Retrieves and concatenates transcript text for a YouTube video."""
     try:
-        try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US'])
-        except AttributeError:
-            transcript_list = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'en-US'])
-
-        full_text = " ".join([item['text'] for item in transcript_list])
+        client = _get_youtube_transcript_client()
+        fetched_transcript = client.fetch(video_id, languages=['en', 'en-US'])
+        full_text = " ".join(snippet.text for snippet in fetched_transcript)
         return full_text
     except (TranscriptsDisabled, NoTranscriptFound):
         raise HTTPException(status_code=404, detail="No public English transcript found for this video.")
